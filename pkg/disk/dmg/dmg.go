@@ -118,7 +118,6 @@ func newLZMAReader(data []byte) (io.Reader, error) {
 
 const (
 	sectorSize = 0x200
-	blockSize  = 0xc8000
 )
 
 var ErrEncrypted = errors.New("DMG is encrypted")
@@ -924,11 +923,14 @@ func (d *DMG) Partition(name string) (*Partition, error) {
 func (d *DMG) Load() error {
 
 	var out bytes.Buffer
-	dat := make([]byte, 0, blockSize)
 
 	/* Primary GPT Header */
 	if block, err := d.Partition("Primary GPT Header"); err == nil {
 		for i, chunk := range block.Chunks {
+			if err := d.validateChunkRange(chunk); err != nil {
+				return fmt.Errorf("invalid chunk %d in block %s: %w", i, block.Name, err)
+			}
+			dat := make([]byte, chunk.CompressedLength)
 			if _, err := chunk.DecompressChunk(d.sr, dat, &out); err != nil {
 				return fmt.Errorf("failed to decompress chunk %d in block %s: %w", i, block.Name, err)
 			}
@@ -948,6 +950,10 @@ func (d *DMG) Load() error {
 		/* Primary GPT Table */
 		if block, err := d.Partition("Primary GPT Table"); err == nil {
 			for i, chunk := range block.Chunks {
+				if err := d.validateChunkRange(chunk); err != nil {
+					return fmt.Errorf("invalid chunk %d in block %s: %w", i, block.Name, err)
+				}
+				dat := make([]byte, chunk.CompressedLength)
 				if _, err := chunk.DecompressChunk(d.sr, dat, &out); err != nil {
 					return fmt.Errorf("failed to decompress chunk %d in block %s: %w", i, block.Name, err)
 				}
@@ -1008,16 +1014,6 @@ func (d *DMG) Load() error {
 
 // ReadAt impliments the io.ReadAt interface requirement of the Device interface
 func (d *DMG) ReadAt(buf []byte, off int64) (n int, err error) {
-
-	var (
-		rdOffs int64
-		rdSize int
-	)
-
-	var bw bytes.Buffer
-
-	w := bufio.NewWriter(&bw)
-
 	off += int64(d.apfsPartitionOffset) // map offset from start of Apple_APFS partition
 	length := int64(len(buf))
 
@@ -1042,62 +1038,76 @@ func (d *DMG) ReadAt(buf []byte, off int64) (n int, err error) {
 		}
 	}
 
-	var out bytes.Buffer
-	dec := make([]byte, 0, d.maxChunkSize)
-
 	for length > 0 {
-
 		if int(entryIdx) >= len(apfsChunks)-1 {
 			return n, fmt.Errorf("entryIdx >= []apfsChunks")
 		}
 
 		sect := apfsChunks[entryIdx]
+		rdOffs := max(off-int64(sect.DiskOffset), 0)
 
-		rdOffs = max(off-int64(sect.DiskOffset), 0)
-
+		// On a cache hit copy straight into the caller's buffer; allocate the
+		// compressed input buffer only on a miss, sized to the chunk.
+		var data []byte
+		var found bool
 		if !d.config.DisableCache {
-			// check the cache
-			if val, found := d.cache.Get(entryIdx); found {
-				if _, err = out.Write(val); err != nil {
-					return n, fmt.Errorf("failed to write cached chunk data to writer")
-				}
-			} else {
-				if _, err = sect.DecompressChunk(d.sr, dec, &out); err != nil {
-					return n, fmt.Errorf("failed to decompressed chunk %d", entryIdx)
-				}
-				// Cache the decompressed data
-				cacheCopy := make([]byte, out.Len())
-				copy(cacheCopy, out.Bytes())
-				d.cache.Add(entryIdx, cacheCopy)
+			data, found = d.cache.Get(entryIdx)
+		}
+		if !found {
+			if data, err = d.decompressChunk(sect); err != nil {
+				return n, fmt.Errorf("failed to decompress chunk %d: %w", entryIdx, err)
 			}
-		} else {
-			if _, err = sect.DecompressChunk(d.sr, dec, &out); err != nil {
-				return n, fmt.Errorf("failed to decompressed chunk %d", entryIdx)
+			if !d.config.DisableCache {
+				d.cache.Add(entryIdx, data)
 			}
 		}
 
-		if length >= int64(out.Len())-rdOffs {
-			if rdSize, err = w.Write(out.Bytes()[rdOffs:]); err != nil {
-				return n, fmt.Errorf("failed to write decompressed chunk to output buffer")
-			}
-		} else {
-			if rdSize, err = w.Write(out.Bytes()[rdOffs : rdOffs+length]); err != nil {
-				return n, fmt.Errorf("failed to write decompressed chunk to output buffer")
-			}
+		avail := int64(len(data)) - rdOffs
+		if avail <= 0 {
+			// Zero-length chunk (comment or empty fill); nothing to copy.
+			entryIdx++
+			continue
 		}
-
-		out.Reset()
-
-		n += rdSize
-		length -= int64(rdSize)
+		rdSize := min(avail, length)
+		copy(buf[n:], data[rdOffs:rdOffs+rdSize])
+		n += int(rdSize)
+		length -= rdSize
+		off += rdSize
 		entryIdx++
 	}
 
-	w.Flush()
+	return n, nil
+}
 
-	bw.Read(buf)
+// validateChunkRange rejects chunk metadata that would over-allocate or
+// read past the backing file. DMG chunk fields come from untrusted
+// metadata and could otherwise trigger a makeslice panic or OOM.
+func (d *DMG) validateChunkRange(sect udifBlockChunk) error {
+	size := d.sr.Size()
+	if int64(sect.CompressedLength) < 0 || int64(sect.CompressedLength) > size {
+		return fmt.Errorf("chunk compressed length %d out of range", sect.CompressedLength)
+	}
+	if int64(sect.CompressedOffset) < 0 || sect.CompressedOffset+sect.CompressedLength > uint64(size) {
+		return fmt.Errorf("chunk compressed range %d+%d out of bounds", sect.CompressedOffset, sect.CompressedLength)
+	}
+	return nil
+}
 
-	return len(buf), nil
+// decompressChunk validates and decompresses a chunk into a fresh slice that
+// the caller may retain (and cache).
+func (d *DMG) decompressChunk(sect udifBlockChunk) ([]byte, error) {
+	if err := d.validateChunkRange(sect); err != nil {
+		return nil, err
+	}
+	var out bytes.Buffer
+	dec := make([]byte, sect.CompressedLength)
+	if _, err := sect.DecompressChunk(d.sr, dec, &out); err != nil {
+		return nil, err
+	}
+	if int64(out.Len()) != int64(sect.DiskLength) {
+		return nil, fmt.Errorf("chunk decompressed to %d bytes, expected %d: %w", out.Len(), sect.DiskLength, io.ErrUnexpectedEOF)
+	}
+	return out.Bytes(), nil
 }
 
 // ReadFile extracts a file from the DMG
