@@ -6,14 +6,13 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"github.com/apex/log"
+	"github.com/blacktop/go-apfs/pkg/disk"
+	"github.com/blacktop/go-apfs/types"
 	"io"
 	"os"
 	"path/filepath"
 	"strings"
-
-	"github.com/apex/log"
-	"github.com/blacktop/go-apfs/pkg/disk"
-	"github.com/blacktop/go-apfs/types"
 )
 
 // fsNodeCacheSize bounds the LRU of decoded B-tree nodes attached to the FS
@@ -512,26 +511,39 @@ func (a *APFS) Copy(src, dest string) (err error) {
 	if err != nil {
 		return fmt.Errorf("failed to find %s: %v", src, err)
 	}
+	if len(entries) == 0 {
+		return nil
+	}
+	// Directory extraction has historically created a missing destination.
+	if entries[0].Val.(types.JDrecVal).Flags == types.DT_DIR {
+		if err := os.MkdirAll(dest, 0755); err != nil {
+			return fmt.Errorf("failed to create destination %s: %w", dest, err)
+		}
+	}
+	root, err := os.OpenRoot(dest)
+	if err != nil {
+		return fmt.Errorf("failed to open destination %s: %w", dest, err)
+	}
+	defer root.Close()
 
 	for _, entry := range entries {
 		if entry.Val.(types.JDrecVal).Flags == types.DT_DIR {
 			dirName := entry.Key.(types.JDrecHashedKeyT).Name
-			subDir, ok := safeJoinPath(dest, dirName)
+			subDir, ok := safeJoinPath(".", dirName)
 			if !ok {
-				log.Warnf("skipping directory record with unsafe name %q", dirName)
-				continue
+				return fmt.Errorf("unsafe directory record name %q", dirName)
 			}
-			if err := os.MkdirAll(subDir, 0755); err != nil {
+			if err := root.MkdirAll(subDir, 0755); err != nil {
 				return fmt.Errorf("failed to create directory %s: %v", subDir, err)
 			}
 			// Recurse by directory OID instead of re-resolving the path.
-			if err := a.copyDir(uint64(entry.Val.(types.JDrecVal).FileID), subDir); err != nil {
+			if err := a.copyDir(root, uint64(entry.Val.(types.JDrecVal).FileID), subDir); err != nil {
 				return err
 			}
 			continue
 		}
 
-		if err := a.copyFile(entry, dest); err != nil {
+		if err := a.copyFile(root, entry, "."); err != nil {
 			return err
 		}
 	}
@@ -539,21 +551,18 @@ func (a *APFS) Copy(src, dest string) (err error) {
 	return nil
 }
 
-// safeJoinPath joins name to dest and returns the result only if it stays
-// under dest. DMG record names are untrusted; this contains them
-// regardless of separator or platform.
+// safeJoinPath accepts one record name. Filesystem operations must still use
+// os.Root to prevent symlinks from escaping the extraction destination.
 func safeJoinPath(dest, name string) (string, bool) {
-	p := filepath.Join(dest, name)
-	rel, err := filepath.Rel(dest, p)
-	if err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+	if !filepath.IsLocal(name) || name == "." || strings.ContainsAny(name, "/\\\x00") {
 		return "", false
 	}
-	return p, true
+	return filepath.Join(dest, name), true
 }
 
 // copyDir copies the contents of directory oid into dest, recursing by
 // child FileID so a deep tree needs one B-tree lookup per directory.
-func (a *APFS) copyDir(oid uint64, dest string) error {
+func (a *APFS) copyDir(root *os.Root, oid uint64, dest string) error {
 	fsRecords, err := a.fsOMapBtree.GetFSRecordsForOid(a.r, a.FSRootBtree, types.OidT(oid), types.XidT(^uint64(0)))
 	if err != nil {
 		return fmt.Errorf("failed to get fs records for oid %#x: %v", types.OidT(oid), err)
@@ -569,17 +578,16 @@ func (a *APFS) copyDir(oid uint64, dest string) error {
 			dirName := rec.Key.(types.JDrecHashedKeyT).Name
 			subDir, ok := safeJoinPath(dest, dirName)
 			if !ok {
-				log.Warnf("skipping directory record with unsafe name %q", dirName)
-				continue
+				return fmt.Errorf("unsafe directory record name %q in %s", dirName, dest)
 			}
-			if err := os.MkdirAll(subDir, 0755); err != nil {
+			if err := root.MkdirAll(subDir, 0755); err != nil {
 				return fmt.Errorf("failed to create directory %s: %v", subDir, err)
 			}
-			if err := a.copyDir(uint64(val.FileID), subDir); err != nil {
+			if err := a.copyDir(root, uint64(val.FileID), subDir); err != nil {
 				return err
 			}
 		default:
-			if err := a.copyFile(rec, dest); err != nil {
+			if err := a.copyFile(root, rec, dest); err != nil {
 				return err
 			}
 		}
@@ -588,7 +596,11 @@ func (a *APFS) copyDir(oid uint64, dest string) error {
 	return nil
 }
 
-func (a *APFS) copyFile(rec types.NodeEntry, dest string) error {
+func (a *APFS) copyFile(root *os.Root, rec types.NodeEntry, dest string) error {
+	name := rec.Key.(types.JDrecHashedKeyT).Name
+	if _, ok := safeJoinPath(dest, name); !ok {
+		return fmt.Errorf("unsafe file record name %q in %s", name, dest)
+	}
 	fsRecords, err := a.fsOMapBtree.GetFSRecordsForOid(a.r, a.FSRootBtree, types.OidT(rec.Val.(types.JDrecVal).FileID), types.XidT(^uint64(0)))
 	if err != nil {
 		return fmt.Errorf("failed to get fs records: %v", err)
@@ -600,12 +612,14 @@ func (a *APFS) copyFile(rec types.NodeEntry, dest string) error {
 	var uncompressedSize uint64
 	var totalBytesWritten uint64
 	var fexts []types.FileExtent
+	var foundInode bool
 
 	compressed := false
 
 	for _, rec := range fsRecords {
 		switch rec.Hdr.GetType() {
 		case types.APFS_TYPE_INODE:
+			foundInode = true
 			if rec.Val.(types.JInodeVal).InternalFlags&types.INODE_HAS_UNCOMPRESSED_SIZE != 0 {
 				compressed = true
 				uncompressedSize = rec.Val.(types.JInodeVal).UncompressedSize
@@ -663,24 +677,24 @@ func (a *APFS) copyFile(rec types.NodeEntry, dest string) error {
 		}
 	}
 
+	if !foundInode {
+		return fmt.Errorf("missing inode for file oid %#x", rec.Val.(types.JDrecVal).FileID)
+	}
 	if fileName == "" {
-		return nil
+		return fmt.Errorf("missing inode name for file oid %#x", rec.Val.(types.JDrecVal).FileID)
 	}
 
-	// DMG record names are untrusted; verify the joined path
-	// stays under dest (handles all separator forms on every platform).
 	outPath, ok := safeJoinPath(dest, fileName)
 	if !ok {
-		log.Warnf("skipping file record with unsafe name %q", fileName)
-		return nil
+		return fmt.Errorf("unsafe file record name %q in %s", fileName, dest)
 	}
 	if symlink != "" {
-		if err := os.Symlink(symlink, outPath); err != nil {
+		if err := root.Symlink(symlink, outPath); err != nil {
 			return fmt.Errorf("failed to create symlink %s -> %s: %v", outPath, symlink, err)
 		}
 		return nil
 	}
-	fo, err := os.Create(outPath)
+	fo, err := root.Create(outPath)
 	if err != nil {
 		return fmt.Errorf("failed to create %s: %v", outPath, err)
 	}
